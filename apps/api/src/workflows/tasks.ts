@@ -4,6 +4,7 @@ import { db } from '../db.js'
 import { getConfig } from '../config.js'
 import { appendRunEvent, recordOwnerSignature, transitionOpportunity } from '../domain/demo-service.js'
 import { evaluatePricePolicy } from '../domain/policy.js'
+import { httpError } from '../http-errors.js'
 import { dispatchProviderAction, type ProviderRegistry } from '../outbox.js'
 import { createTeracContractReviewProvider } from '../providers/registry.js'
 import type { TeracStudyData } from '../providers/terac/index.js'
@@ -476,6 +477,94 @@ export async function sendNordlichtOutreach(demoRunId: string, registry: Provide
   const maasLinq = maasResult.data as unknown as LinqSendResult
   await db.message.upsert({ where: { provider_externalId: { provider: Provider.LINQ, externalId: maasResult.externalId } }, create: { demoRunId, opportunityId: maas.id, externalId: maasResult.externalId, threadExternalId: maasLinq.chatId, direction: 'OUTBOUND', status: maasResult.status, sanitizedBody: 'Policy-test prompt delivered to consenting Maas role-player.', rolePlayer: true, live: maasResult.live }, update: {} })
   await appendRunEventOnce(demoRunId, { opportunityId: maas.id, type: 'message.sent', status: 'OUTREACH', summary: 'Linq delivered the policy-test prompt to the consenting Maas role-player.', actor: 'linq', proofRef: maasResult.externalId })
+}
+
+export async function restartNordlichtOutreach(demoRunId: string, registry: ProviderRegistry): Promise<void> {
+  const config = getConfig()
+  if (!config.DEMO_HYBRID_MODE) throw httpError(409, 'Outreach restart is available only in hybrid demo mode')
+  if (!config.REAL_ACTIONS_ENABLED || config.PROVIDER_MODE !== 'real') {
+    throw httpError(409, 'Hybrid real actions are not enabled')
+  }
+
+  const opportunity = await db.opportunity.findFirstOrThrow({
+    where: { demoRunId, company: { name: 'Nordlicht Import GmbH' } },
+    include: { company: true, contact: true, demoRun: true },
+  })
+  if (opportunity.demoRun.mode !== 'FAKE') throw httpError(409, 'Outreach restart requires a hybrid demo run')
+  assertLinqRecipientEligible(opportunity.company, opportunity.contact, config.LINQ_NORDLICHT_RECIPIENT)
+
+  const prefix = `linq-outreach-restart:${demoRunId}:${opportunity.id}:`
+  let action = await db.providerAction.findFirst({
+    where: { demoRunId, provider: Provider.LINQ, kind: 'message.send', idempotencyKey: { startsWith: prefix } },
+    orderBy: { createdAt: 'desc' },
+  })
+
+  if (opportunity.demoRun.status !== 'RUNNING' && action?.status !== 'SUCCEEDED') {
+    throw httpError(409, 'Outreach restart requires the active hybrid demo run')
+  }
+
+  if (!action) {
+    if (opportunity.stage !== 'PAUSED' || opportunity.stageReason !== 'BAND_ESCALATE') {
+      throw httpError(409, 'Only a Band-escalated Nordlicht outreach can be restarted')
+    }
+    const idempotencyKey = `${prefix}${opportunity.version}`
+    const request = consentedLinqRequest('nordlicht', 'OUTREACH_V1')
+    await transitionOpportunity({
+      opportunityId: opportunity.id,
+      to: 'ENGAGED',
+      reason: null,
+      eventType: 'outreach.restarted',
+      summary: 'Owner restarted the Nordlicht conversation from the original campaign outreach.',
+      actor: 'owner',
+      action: {
+        provider: Provider.LINQ,
+        kind: 'message.send',
+        idempotencyKey,
+        request: request as unknown as Prisma.InputJsonValue,
+      },
+    })
+    action = await db.providerAction.findUniqueOrThrow({ where: { idempotencyKey } })
+  } else if (opportunity.stage !== 'ENGAGED' && action.status !== 'SUCCEEDED') {
+    throw httpError(409, 'Nordlicht has already advanced beyond the outreach restart point')
+  }
+
+  const result = await dispatchProviderAction(action.id, registry)
+  const linq = result.data as unknown as LinqSendResult
+  if (
+    result.provider !== Provider.LINQ
+    || !result.live
+    || (result.status !== 'ACCEPTED' && result.status !== 'COMPLETE')
+    || !result.externalId
+    || typeof linq.messageId !== 'string'
+    || !linq.messageId
+    || typeof linq.chatId !== 'string'
+    || !linq.chatId
+  ) {
+    throw new Error('Linq returned invalid restart acceptance proof')
+  }
+  await db.message.upsert({
+    where: { provider_externalId: { provider: Provider.LINQ, externalId: result.externalId } },
+    create: {
+      demoRunId,
+      opportunityId: opportunity.id,
+      externalId: result.externalId,
+      threadExternalId: linq.chatId,
+      direction: 'OUTBOUND',
+      status: result.status,
+      sanitizedBody: 'Restarted campaign outreach accepted by Linq for the consenting Nordlicht role-player.',
+      rolePlayer: true,
+      live: result.live,
+    },
+    update: {},
+  })
+  await appendRunEventOnce(demoRunId, {
+    opportunityId: opportunity.id,
+    type: 'message.sent',
+    status: 'ENGAGED',
+    summary: 'Linq accepted the restarted original campaign outreach for delivery to the consenting Nordlicht role-player.',
+    actor: 'linq',
+    proofRef: result.externalId,
+  })
 }
 
 export async function runBandNegotiation(demoRunId: string, registry: ProviderRegistry): Promise<void> {

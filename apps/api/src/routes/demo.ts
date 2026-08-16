@@ -8,7 +8,9 @@ import { collectProof, createDemoRun, decideCampaign, getDemoRunSnapshot, latest
 import { FakeRehearsalConflictError, runFakeRehearsal } from '../domain/fake-run.js'
 import { verifyDemoRun } from '../domain/verify.js'
 import { httpError } from '../http-errors.js'
+import { createProviderRegistry } from '../providers/registry.js'
 import { reconcilePendingRenderTaskRuns, triggerRenderTask } from '../workflows/render-client.js'
+import { restartNordlichtOutreach } from '../workflows/tasks.js'
 
 const approvedRenderTasks = [
   'discover-research-leads',
@@ -168,6 +170,11 @@ export function registerDemoRoutes(app: FastifyInstance): void {
       throw error
     }
     return demoRunSnapshotSchema.parse(await getDemoRunSnapshot(request.params.id))
+  })
+
+  app.post<{ Params: { id: string } }>('/api/v1/demo-runs/:id/restart-outreach', { preHandler: requireOwner }, async (request) => {
+    await restartNordlichtOutreach(request.params.id, createProviderRegistry())
+    return reconciledSnapshot(request.params.id)
   })
 
   app.post<{ Params: { id: string } }>('/api/v1/demo-runs/:id/campaign-decision', { preHandler: requireOwner }, async (request) => {

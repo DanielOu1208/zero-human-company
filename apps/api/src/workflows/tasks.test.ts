@@ -4,11 +4,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => {
   const db = {
     demoRun: { findUniqueOrThrow: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
-    providerAction: { upsert: vi.fn() },
+    providerAction: { upsert: vi.fn(), findFirst: vi.fn(), findUniqueOrThrow: vi.fn() },
     humanStudy: { findUnique: vi.fn(), upsert: vi.fn() },
     campaignRevision: { updateMany: vi.fn() },
     event: { findFirst: vi.fn() },
     opportunity: { findFirstOrThrow: vi.fn() },
+    message: { upsert: vi.fn() },
     providerEvent: { findUnique: vi.fn() },
     document: { upsert: vi.fn(), update: vi.fn() },
     approval: { upsert: vi.fn() },
@@ -23,6 +24,8 @@ const mocks = vi.hoisted(() => {
     createTeracContractReviewProvider: vi.fn(),
     config: {
       DEMO_HYBRID_MODE: false,
+      PROVIDER_MODE: 'real',
+      REAL_ACTIONS_ENABLED: true,
       DOCUMENSO_BUYER_EMAIL: 'anja@nordlicht.example' as string | undefined,
       LINQ_NORDLICHT_RECIPIENT: 'anja@nordlicht.example',
     },
@@ -54,11 +57,129 @@ import {
   evaluateBandVerdict,
   mockDocumentEvidenceTimestamps,
   recipientFingerprint,
+  restartNordlichtOutreach,
   reviewContractAndCreateEnvelope,
   resolveMonidCompanyMatch,
   runTeracCampaignStudy,
   teracStudyCompletionEvent,
 } from './tasks.js'
+
+describe('hybrid Nordlicht outreach restart', () => {
+  const restartAction = {
+    id: 'restart-action-1',
+    idempotencyKey: 'linq-outreach-restart:run-1:opp-1:7',
+  }
+
+  beforeEach(() => {
+    vi.resetAllMocks()
+    mocks.config.DEMO_HYBRID_MODE = true
+    mocks.config.PROVIDER_MODE = 'real'
+    mocks.config.REAL_ACTIONS_ENABLED = true
+    mocks.db.opportunity.findFirstOrThrow.mockResolvedValue({
+      id: 'opp-1',
+      stage: 'PAUSED',
+      stageReason: 'BAND_ESCALATE',
+      version: 7,
+      company,
+      contact: { ...contact, addressHash: recipientFingerprint('anja@nordlicht.example') },
+      demoRun: { mode: 'FAKE', status: 'RUNNING' },
+    })
+    mocks.db.providerAction.findFirst.mockResolvedValue(null)
+    mocks.db.providerAction.findUniqueOrThrow.mockResolvedValue(restartAction)
+    mocks.db.event.findFirst.mockResolvedValue(null)
+    mocks.dispatchProviderAction.mockResolvedValue({
+      provider: Provider.LINQ,
+      externalId: 'linq-restart-message',
+      live: true,
+      status: 'ACCEPTED',
+      data: { messageId: 'linq-restart-message', chatId: 'linq-chat-1', service: 'iMessage' },
+      redacted: {},
+    })
+  })
+
+  it('atomically resumes the pause and creates a new idempotent first outreach', async () => {
+    await restartNordlichtOutreach('run-1', new Map())
+
+    expect(mocks.transitionOpportunity).toHaveBeenCalledWith(expect.objectContaining({
+      opportunityId: 'opp-1',
+      to: 'ENGAGED',
+      eventType: 'outreach.restarted',
+      action: expect.objectContaining({
+        provider: Provider.LINQ,
+        kind: 'message.send',
+        idempotencyKey: restartAction.idempotencyKey,
+        request: { recipient: { consented: true, rolePlayerId: 'nordlicht' }, template: 'OUTREACH_V1', args: {} },
+      }),
+    }))
+    expect(mocks.dispatchProviderAction).toHaveBeenCalledWith('restart-action-1', expect.any(Map))
+    expect(mocks.db.message.upsert).toHaveBeenCalledWith(expect.objectContaining({
+      create: expect.objectContaining({ externalId: 'linq-restart-message', threadExternalId: 'linq-chat-1', live: true }),
+    }))
+    expect(mocks.appendRunEvent).toHaveBeenCalledWith('run-1', expect.objectContaining({
+      type: 'message.sent',
+      proofRef: 'linq-restart-message',
+    }))
+  })
+
+  it('reuses the durable restart action after an interrupted request', async () => {
+    mocks.db.opportunity.findFirstOrThrow.mockResolvedValueOnce({
+      id: 'opp-1',
+      stage: 'ENGAGED',
+      stageReason: null,
+      version: 8,
+      company,
+      contact: { ...contact, addressHash: recipientFingerprint('anja@nordlicht.example') },
+      demoRun: { mode: 'FAKE', status: 'RUNNING' },
+    })
+    mocks.db.providerAction.findFirst.mockResolvedValueOnce({ ...restartAction, status: 'SUCCEEDED' })
+
+    await restartNordlichtOutreach('run-1', new Map())
+
+    expect(mocks.transitionOpportunity).not.toHaveBeenCalled()
+    expect(mocks.db.providerAction.findUniqueOrThrow).not.toHaveBeenCalled()
+    expect(mocks.dispatchProviderAction).toHaveBeenCalledWith('restart-action-1', expect.any(Map))
+  })
+
+  it('replays a completed response safely after the opportunity advances', async () => {
+    mocks.db.opportunity.findFirstOrThrow.mockResolvedValueOnce({
+      id: 'opp-1',
+      stage: 'NEGOTIATING',
+      stageReason: null,
+      version: 9,
+      company,
+      contact: { ...contact, addressHash: recipientFingerprint('anja@nordlicht.example') },
+      demoRun: { mode: 'FAKE', status: 'COMPLETE' },
+    })
+    mocks.db.providerAction.findFirst.mockResolvedValueOnce({ ...restartAction, status: 'SUCCEEDED' })
+    mocks.dispatchProviderAction.mockResolvedValueOnce({
+      provider: Provider.LINQ,
+      externalId: 'linq-restart-message',
+      live: true,
+      status: 'COMPLETE',
+      data: { messageId: 'linq-restart-message', chatId: 'linq-chat-1', service: 'iMessage' },
+      redacted: {},
+    })
+
+    await expect(restartNordlichtOutreach('run-1', new Map())).resolves.toBeUndefined()
+    expect(mocks.transitionOpportunity).not.toHaveBeenCalled()
+    expect(mocks.dispatchProviderAction).toHaveBeenCalledTimes(1)
+  })
+
+  it('fails closed when Linq does not return live accepted message and chat proof', async () => {
+    mocks.dispatchProviderAction.mockResolvedValueOnce({
+      provider: Provider.LINQ,
+      externalId: 'linq-restart-message',
+      live: true,
+      status: 'ACCEPTED',
+      data: { messageId: 'linq-restart-message' },
+      redacted: {},
+    })
+
+    await expect(restartNordlichtOutreach('run-1', new Map())).rejects.toThrow(/invalid restart acceptance proof/)
+    expect(mocks.db.message.upsert).not.toHaveBeenCalled()
+    expect(mocks.appendRunEvent).not.toHaveBeenCalled()
+  })
+})
 
 const company = {
   name: 'Nordlicht Import GmbH',

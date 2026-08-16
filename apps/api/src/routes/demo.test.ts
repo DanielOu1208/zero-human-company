@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   hybridMode: false,
   providerMode: 'fake',
   reconcilePendingRenderTaskRuns: vi.fn(),
+  restartNordlichtOutreach: vi.fn(),
   runFakeRehearsal: vi.fn(),
   triggerRenderTask: vi.fn(),
   verifyDemoRun: vi.fn(),
@@ -47,6 +48,8 @@ vi.mock('../workflows/render-client.js', () => ({
   reconcilePendingRenderTaskRuns: mocks.reconcilePendingRenderTaskRuns,
   triggerRenderTask: mocks.triggerRenderTask,
 }))
+vi.mock('../providers/registry.js', () => ({ createProviderRegistry: vi.fn(() => new Map()) }))
+vi.mock('../workflows/tasks.js', () => ({ restartNordlichtOutreach: mocks.restartNordlichtOutreach }))
 
 import { registerDemoRoutes } from './demo.js'
 import { FakeRehearsalConflictError } from '../domain/fake-run.js'
@@ -136,10 +139,21 @@ beforeEach(() => {
   mocks.verifyDemoRun.mockResolvedValue({ passed: true })
   mocks.getDemoRunSnapshot.mockImplementation(async (id: string) => snapshot(id))
   mocks.reconcilePendingRenderTaskRuns.mockResolvedValue(undefined)
+  mocks.restartNordlichtOutreach.mockResolvedValue(undefined)
   mocks.triggerRenderTask.mockResolvedValue('task-run')
 })
 
 describe('deployment run-mode gates', () => {
+  it('restarts only the requested run outreach and returns its reconciled snapshot', async () => {
+    const handler = registeredRoutes().get('/api/v1/demo-runs/:id/restart-outreach')!
+
+    const result = await handler(request('restart-run'), reply())
+
+    expect(mocks.restartNordlichtOutreach).toHaveBeenCalledWith('restart-run', expect.any(Map))
+    expect(mocks.getDemoRunSnapshot).toHaveBeenCalledWith('restart-run')
+    expect(result).toEqual(snapshot('restart-run'))
+  })
+
   it('requires JUDGE creation in real provider mode before creating a run', async () => {
     mocks.providerMode = 'real'
     const handler = registeredRoutes().get('/api/v1/demo-runs')!
