@@ -4,7 +4,8 @@ import { useDemo } from '../state/DemoContext'
 
 const providerLabels = ['STRIPE', 'TERAC', 'MONID', 'LINQ', 'BAND', 'RENDER', 'DOCUMENSO', 'OPENAI'] as const
 
-function runBadgeLabel(mode: 'FAKE' | 'JUDGE', status: string): string {
+function runBadgeLabel(mode: 'FAKE' | 'JUDGE', status: string, hybrid: boolean): string {
+  if (hybrid) return 'HYBRID DEMO'
   if (mode === 'FAKE') return 'REHEARSAL'
   if (status === 'COMPLETE') return 'RUN COMPLETE'
   return 'JUDGED RUN'
@@ -62,12 +63,18 @@ export function RunControl() {
     }
   }
 
-  const runBadge = runBadgeLabel(runtimeRun.mode, runtimeRun.status)
+  const hasLiveProof = runtimeRun.proof.some((item) => item.live)
+  const hasMockProof = runtimeRun.proof.some((item) => !item.live)
+  const isHybridDemo = runtimeRun.mode === 'FAKE' && hasLiveProof && hasMockProof
+  const hasMockTeracProof = runtimeRun.proof.some((item) => item.provider === 'TERAC' && !item.live)
+  const runBadge = runBadgeLabel(runtimeRun.mode, runtimeRun.status, isHybridDemo)
   const runBadgeClass = runBadgeTone(runtimeRun.mode, runtimeRun.status)
   let completionMessage: string | null = null
   let completionClass = 'text-emerald-200'
   if (runtimeRun.status === 'COMPLETE' && runtimeRun.mode === 'FAKE') {
-    completionMessage = 'Rehearsal complete. Fake provider records are intentionally rejected by the judged-run verifier.'
+    completionMessage = isHybridDemo
+      ? 'Hybrid demo complete. Terac, Documenso, and inline workflow records are mock evidence; LIVE badges identify configured real adapters. This run is intentionally rejected by the judged-run verifier.'
+      : 'Rehearsal complete. Fake provider records are intentionally rejected by the judged-run verifier.'
     completionClass = 'text-amber-100'
   } else if (runtimeRun.status === 'COMPLETE') {
     completionMessage = 'Run complete. The strict same-run verifier is the final proof-readiness gate.'
@@ -108,7 +115,7 @@ export function RunControl() {
 
         {runtimeRun.status === 'AWAITING_CAMPAIGN_APPROVAL' ? (
           <div className="mt-4 flex items-center justify-between gap-4 rounded-md bg-white/5 p-3">
-            <div><p className="text-sm">Owner action 1 of 2</p><p className="text-xs text-white/55">Approve Terac’s selected campaign, or reject and pause the run.</p></div>
+            <div><p className="text-sm">Owner action 1 of 2</p><p className="text-xs text-white/55">{hasMockTeracProof ? 'Approve the mock demo-selected campaign, or reject and pause the run.' : 'Approve Terac’s selected campaign, or reject and pause the run.'}</p></div>
             <div className="flex gap-2">
               <button disabled={busy} onClick={() => void act(() => decideCampaign('REJECT'))} className="rounded border border-white/20 px-3 py-2 text-xs disabled:opacity-50">Reject</button>
               <button disabled={busy} onClick={() => void act(() => decideCampaign('APPROVE'))} className="rounded bg-white px-3 py-2 text-xs font-medium text-ink disabled:opacity-50">Approve</button>

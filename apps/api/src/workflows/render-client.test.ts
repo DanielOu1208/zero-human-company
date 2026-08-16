@@ -24,6 +24,10 @@ const mocks = vi.hoisted(() => ({
     getTaskRun: vi.fn(),
     listTaskRuns: vi.fn(),
   },
+  createProviderRegistry: vi.fn(() => new Map()),
+  executeWorkflowTask: vi.fn(),
+  hybridMode: false,
+  Render: vi.fn(),
 }))
 
 vi.mock('../db.js', () => ({ db: mocks.db }))
@@ -32,13 +36,16 @@ vi.mock('../config.js', () => ({
     RENDER_API_KEY: 'render-key',
     RENDER_OWNER_ID: 'owner-id',
     RENDER_WORKFLOW_SLUG: 'company-workflow',
+    DEMO_HYBRID_MODE: mocks.hybridMode,
   }),
 }))
 vi.mock('@renderinc/sdk', () => ({
-  Render: vi.fn(function Render() {
+  Render: mocks.Render.mockImplementation(function Render() {
     return { workflows: mocks.workflows }
   }),
 }))
+vi.mock('./tasks.js', () => ({ executeWorkflowTask: mocks.executeWorkflowTask }))
+vi.mock('../providers/registry.js', () => ({ createProviderRegistry: mocks.createProviderRegistry }))
 
 import { reconcilePendingRenderTaskRuns, triggerRenderTask } from './render-client.js'
 
@@ -59,6 +66,7 @@ const plannedIntent = {
 describe('durable Render task intent', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mocks.hybridMode = false
     mocks.db.demoRun.findUniqueOrThrow.mockResolvedValue({ workspace: { killSwitch: false } })
     mocks.db.renderTaskIntent.upsert.mockResolvedValue(plannedIntent)
     mocks.db.renderTaskIntent.update.mockResolvedValue(plannedIntent)
@@ -68,6 +76,7 @@ describe('durable Render task intent', () => {
     mocks.db.workflowRun.findMany.mockResolvedValue([])
     mocks.workflows.listTaskRuns.mockResolvedValue([])
     mocks.workflows.startTask.mockResolvedValue({ taskRunId: 'render-run-1' })
+    mocks.executeWorkflowTask.mockResolvedValue(undefined)
   })
 
   it('creates the unique intent before starting the provider task', async () => {
@@ -272,5 +281,135 @@ describe('durable Render task intent', () => {
 
     await expect(triggerRenderTask('demo-1', 'discover-research-leads')).resolves.toBe('render-accepted')
     expect(mocks.workflows.startTask).not.toHaveBeenCalled()
+  })
+
+  it('executes hybrid tasks inline without constructing the Render SDK and records non-live proof', async () => {
+    mocks.hybridMode = true
+
+    await expect(triggerRenderTask('demo-1', 'discover-research-leads')).resolves.toBe('inline:intent-1')
+
+    expect(mocks.Render).not.toHaveBeenCalled()
+    expect(mocks.workflows.startTask).not.toHaveBeenCalled()
+    expect(mocks.executeWorkflowTask).toHaveBeenCalledWith(
+      'discover-research-leads',
+      'demo-1',
+      expect.any(Map),
+    )
+    expect(mocks.db.workflowRun.upsert).toHaveBeenCalledWith(expect.objectContaining({
+      create: expect.objectContaining({
+        externalId: 'inline:intent-1',
+        live: false,
+        status: 'RUNNING',
+      }),
+    }))
+    expect(mocks.db.workflowRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ externalId: 'inline:intent-1' }),
+      data: { status: 'COMPLETED' },
+    }))
+  })
+
+  it('checks the workspace kill switch before hybrid inline execution', async () => {
+    mocks.hybridMode = true
+    mocks.db.demoRun.findUniqueOrThrow.mockResolvedValue({ workspace: { killSwitch: true } })
+
+    await expect(triggerRenderTask('demo-1', 'discover-research-leads'))
+      .rejects.toThrow('Workspace kill switch prevents new Render task starts')
+
+    expect(mocks.executeWorkflowTask).not.toHaveBeenCalled()
+    expect(mocks.createProviderRegistry).not.toHaveBeenCalled()
+  })
+
+  it('fences duplicate hybrid triggers before workflow provider effects execute twice', async () => {
+    mocks.hybridMode = true
+    let externalId: string | null = null
+    mocks.db.renderTaskIntent.upsert.mockImplementation(async () => ({ ...plannedIntent, externalId }))
+    mocks.db.renderTaskIntent.updateMany.mockImplementation(async ({ data }) => {
+      if (data.triggerStatus === 'TRIGGERING') return { count: externalId ? 0 : 1 }
+      if (data.externalId) {
+        externalId = data.externalId
+        return { count: 1 }
+      }
+      return { count: 1 }
+    })
+
+    await expect(triggerRenderTask('demo-1', 'discover-research-leads')).resolves.toBe('inline:intent-1')
+    await expect(triggerRenderTask('demo-1', 'discover-research-leads')).resolves.toBe('inline:intent-1')
+
+    expect(mocks.executeWorkflowTask).toHaveBeenCalledTimes(1)
+  })
+
+  it('marks hybrid workflow proof failed when inline execution fails', async () => {
+    mocks.hybridMode = true
+    mocks.executeWorkflowTask.mockRejectedValueOnce(new Error('inline task failed'))
+
+    await expect(triggerRenderTask('demo-1', 'discover-research-leads')).rejects.toThrow('inline task failed')
+
+    expect(mocks.db.workflowRun.updateMany).toHaveBeenCalledWith({
+      where: {
+        provider: 'RENDER',
+        externalId: 'inline:intent-1',
+        status: { notIn: ['SUCCEEDED', 'COMPLETED', 'FAILED', 'CANCELED'] },
+      },
+      data: { status: 'FAILED' },
+    })
+  })
+
+  it('retries a failed hybrid execution with the stable inline id and a new proof attempt', async () => {
+    mocks.hybridMode = true
+    mocks.db.renderTaskIntent.upsert
+      .mockResolvedValueOnce(plannedIntent)
+      .mockResolvedValueOnce({
+        ...plannedIntent,
+        externalId: 'inline:intent-1',
+        triggerStatus: 'FAILED',
+        lastError: 'first attempt failed',
+      })
+    mocks.executeWorkflowTask
+      .mockRejectedValueOnce(new Error('first attempt failed'))
+      .mockResolvedValueOnce(undefined)
+
+    await expect(triggerRenderTask('demo-1', 'discover-research-leads')).rejects.toThrow('first attempt failed')
+    await expect(triggerRenderTask('demo-1', 'discover-research-leads')).resolves.toBe('inline:intent-1')
+
+    expect(mocks.executeWorkflowTask).toHaveBeenCalledTimes(2)
+    expect(mocks.db.workflowRun.updateMany).toHaveBeenCalledWith({
+      where: { provider: 'RENDER', externalId: 'inline:intent-1', status: { in: ['FAILED', 'RUNNING'] } },
+      data: { status: 'RUNNING', attempt: { increment: 1 }, retried: true },
+    })
+    expect(mocks.db.workflowRun.updateMany).toHaveBeenLastCalledWith({
+      where: {
+        provider: 'RENDER',
+        externalId: 'inline:intent-1',
+        status: { notIn: ['SUCCEEDED', 'COMPLETED', 'FAILED', 'CANCELED'] },
+      },
+      data: { status: 'COMPLETED' },
+    })
+  })
+
+  it('reclaims an expired inline execution lease but not a fresh in-flight lease', async () => {
+    mocks.hybridMode = true
+    const stale = {
+      ...plannedIntent,
+      externalId: 'inline:intent-1',
+      triggerStatus: 'TRIGGERING',
+      triggerToken: 'abandoned-token',
+      leaseExpiresAt: new Date('2020-01-01T00:00:00Z'),
+    }
+    mocks.db.renderTaskIntent.upsert.mockResolvedValueOnce(stale)
+
+    await expect(triggerRenderTask('demo-1', 'discover-research-leads')).resolves.toBe('inline:intent-1')
+    expect(mocks.executeWorkflowTask).toHaveBeenCalledTimes(1)
+    expect(mocks.db.workflowRun.updateMany).toHaveBeenCalledWith({
+      where: { provider: 'RENDER', externalId: 'inline:intent-1', status: { in: ['FAILED', 'RUNNING'] } },
+      data: { status: 'RUNNING', attempt: { increment: 1 }, retried: true },
+    })
+
+    vi.clearAllMocks()
+    mocks.db.renderTaskIntent.upsert.mockResolvedValue({
+      ...stale,
+      leaseExpiresAt: new Date('2999-01-01T00:00:00Z'),
+    })
+    await expect(triggerRenderTask('demo-1', 'discover-research-leads')).resolves.toBe('inline:intent-1')
+    expect(mocks.executeWorkflowTask).not.toHaveBeenCalled()
   })
 })

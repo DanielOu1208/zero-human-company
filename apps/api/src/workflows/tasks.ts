@@ -2,10 +2,10 @@ import { createHash } from 'node:crypto'
 import { DemoRunStatus, Prisma, Provider, RevisionStatus } from '@prisma/client'
 import { db } from '../db.js'
 import { getConfig } from '../config.js'
-import { appendRunEvent, transitionOpportunity } from '../domain/demo-service.js'
+import { appendRunEvent, recordOwnerSignature, transitionOpportunity } from '../domain/demo-service.js'
 import { evaluatePricePolicy } from '../domain/policy.js'
 import { dispatchProviderAction, type ProviderRegistry } from '../outbox.js'
-import { TeracContractReviewProvider } from '../providers/terac/contract-review.js'
+import { createTeracContractReviewProvider } from '../providers/registry.js'
 import type { TeracStudyData } from '../providers/terac/index.js'
 import type { MonidDiscoveryResult } from '../providers/monid/index.js'
 import type { SalesDraftRequest } from '../providers/openai.js'
@@ -199,6 +199,55 @@ type TeracStudyEvidence = {
   selectedRevisionId: string
 }
 
+export function teracStudyCompletionEvent(
+  live: boolean,
+  winnerLabel: string,
+  scoreDelta: number,
+): { summary: string; actor: string } {
+  const lift = scoreDelta.toFixed(2)
+  if (live) {
+    return {
+      summary: `Terac selected ${winnerLabel} with a ${lift}-point average lift.`,
+      actor: 'terac',
+    }
+  }
+  return {
+    summary: `Mock demo route selected ${winnerLabel} with a ${lift}-point average lift; no human Terac study was run.`,
+    actor: 'mock-demo',
+  }
+}
+
+export function contractDocumentCreatedEvent(
+  reviewLive: boolean,
+  envelopeLive: boolean,
+): { summary: string; actor: string } {
+  if (reviewLive && envelopeLive) {
+    return {
+      summary: 'Terac contract review completed for German-law clauses; Documenso started owner-first sequential signing.',
+      actor: 'documenso',
+    }
+  }
+  return {
+    summary: 'Mock, non-legal contract review completed; mock Documenso demo started owner-first sequential signing.',
+    actor: 'mock-demo',
+  }
+}
+
+export function mockDocumentEvidenceTimestamps(acceptedAt: Date): {
+  ownerSignedAt: Date
+  buyerSignedAt: Date
+  completedAt: Date
+} {
+  const acceptedAtMs = acceptedAt.getTime()
+  if (!Number.isFinite(acceptedAtMs)) throw new Error('Mock document evidence requires a valid acceptance timestamp')
+  const buyerSignedAt = new Date(acceptedAtMs + 2_000)
+  return {
+    ownerSignedAt: new Date(acceptedAtMs + 1_000),
+    buyerSignedAt,
+    completedAt: buyerSignedAt,
+  }
+}
+
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
   if (value !== null && typeof value === 'object') {
@@ -247,6 +296,7 @@ type ProcessedLinqAcceptanceReceipt = {
   externalEventId: string
   eventType: string
   processedAt: Date | null
+  processingToken?: string | null
 } | null
 
 export function documensoBuyerFromLinqAcceptance(
@@ -254,7 +304,7 @@ export function documensoBuyerFromLinqAcceptance(
   configuredBuyerEmail: string,
   acceptance: LinqAcceptanceEvent,
   receipt: ProcessedLinqAcceptanceReceipt,
-  expected: { demoRunId: string; opportunityId: string },
+  expected: { demoRunId: string; opportunityId: string; allowInFlightReceipt?: boolean },
 ): DocumensoEnvelopeRequest['buyer'] {
   if (!contact?.consented || !contact.rolePlayer || !contact.name || !contact.addressHash) {
     throw new Error('Documenso buyer requires a consenting role-player contact identity')
@@ -276,7 +326,7 @@ export function documensoBuyerFromLinqAcceptance(
     || receipt.provider !== Provider.LINQ
     || receipt.externalEventId !== acceptance.proofRef
     || receipt.eventType !== 'message.received'
-    || !receipt.processedAt
+    || (!receipt.processedAt && !(expected.allowInFlightReceipt && receipt.processingToken))
   ) {
     throw new Error('Documenso buyer requires a processed Linq acceptance receipt')
   }
@@ -313,6 +363,9 @@ export async function runTeracCampaignStudy(demoRunId: string, registry: Provide
   const data = result.data as unknown as TeracStudyData
   if (data.status !== 'COMPLETE') throw new Error('Terac study did not complete')
   assertTeracStudyBoundToRevisions(data, baseline.id, [candidates[0].id, candidates[1].id])
+  if (run.mode === 'JUDGE' && !result.live) {
+    throw new Error('Judged Terac result must be live and cannot use mock respondent proof')
+  }
   if (run.mode === 'JUDGE' && (!data.respondentCount || data.respondentCount < 1)) {
     throw new Error('Judged Terac result must include at least one human respondent')
   }
@@ -361,7 +414,8 @@ export async function runTeracCampaignStudy(demoRunId: string, registry: Provide
     })
     assertMatchingTeracStudyEvidence(persisted, evidence)
   })
-  await appendRunEventOnce(demoRunId, { type: 'study.completed', status: 'READY_FOR_APPROVAL', summary: `Terac selected ${winner.label} with a ${(selectedScore - baselineScore).toFixed(2)}-point average lift.`, actor: 'terac', proofRef: result.externalId })
+  const completion = teracStudyCompletionEvent(result.live, winner.label, selectedScore - baselineScore)
+  await appendRunEventOnce(demoRunId, { type: 'study.completed', status: 'READY_FOR_APPROVAL', ...completion, proofRef: result.externalId })
 }
 
 export async function discoverResearchLeads(demoRunId: string, registry: ProviderRegistry): Promise<void> {
@@ -470,7 +524,9 @@ export async function runBandNegotiation(demoRunId: string, registry: ProviderRe
 
 export async function reviewContractAndCreateEnvelope(demoRunId: string, registry: ProviderRegistry): Promise<void> {
   const config = getConfig()
-  if (!config.DOCUMENSO_BUYER_EMAIL) throw new Error('DOCUMENSO_BUYER_EMAIL is required for the consenting buyer role-player')
+  const buyerEmail = config.DOCUMENSO_BUYER_EMAIL
+    ?? (config.DEMO_HYBRID_MODE ? config.LINQ_NORDLICHT_RECIPIENT : undefined)
+  if (!buyerEmail) throw new Error('DOCUMENSO_BUYER_EMAIL is required for the consenting buyer role-player')
   const opportunity = await db.opportunity.findFirstOrThrow({
     where: { demoRunId, company: { name: 'Nordlicht Import GmbH' } },
     include: { company: true, contact: true },
@@ -494,20 +550,55 @@ export async function reviewContractAndCreateEnvelope(demoRunId: string, registr
     : null
   const buyer = documensoBuyerFromLinqAcceptance(
     opportunity.contact,
-    config.DOCUMENSO_BUYER_EMAIL,
+    buyerEmail,
     acceptance,
     acceptanceReceipt,
-    { demoRunId, opportunityId: opportunity.id },
+    { demoRunId, opportunityId: opportunity.id, allowInFlightReceipt: config.DEMO_HYBRID_MODE },
   )
-  const reviewProvider = new TeracContractReviewProvider({ baseUrl: config.TERAC_API_BASE_URL, apiKey: config.TERAC_API_KEY, path: config.TERAC_CONTRACT_REVIEW_PATH })
+  if (!acceptance) throw new Error('Contract creation requires explicit Linq acceptance evidence')
+  const reviewProvider = createTeracContractReviewProvider()
   registry.set('TERAC_CONTRACT_REVIEW', reviewProvider)
   const reviewAction = await db.providerAction.upsert({ where: { idempotencyKey: `terac-contract:${demoRunId}` }, create: { demoRunId, provider: Provider.TERAC, kind: 'german-law-contract-review', idempotencyKey: `terac-contract:${demoRunId}`, request: { jurisdiction: 'Germany', contractText: 'Hengxin Home and Nordlicht two-container pilot under German law.', question: 'Review governing law, inspection, delivery, limitation, and dispute clauses.' } }, update: {} })
-  await dispatchProviderAction(reviewAction.id, new Map([['TERAC', reviewProvider]]))
+  const review = await dispatchProviderAction(reviewAction.id, new Map([['TERAC', reviewProvider]]))
   const envelope = await plannedAction(registry, demoRunId, Provider.DOCUMENSO, 'sequential-envelope', `documenso:${demoRunId}:${opportunity.id}`, documensoEnvelopeRequest(buyer))
   const data = envelope.data as unknown as DocumensoEnvelopeData
   await db.document.upsert({ where: { provider_externalId: { provider: Provider.DOCUMENSO, externalId: data.envelopeId } }, create: { demoRunId, opportunityId: opportunity.id, externalId: data.envelopeId, live: envelope.live, status: data.status }, update: {} })
+  const createdEvent = contractDocumentCreatedEvent(review.live, envelope.live)
   if (opportunity.stage === 'AGREEMENT') {
-    await transitionOpportunity({ opportunityId: opportunity.id, to: 'SIGNING', eventType: 'document.created', summary: 'Terac reviewed German-law clauses; Documenso started owner-first sequential signing.', actor: 'documenso', proofRef: envelope.externalId })
+    await transitionOpportunity({ opportunityId: opportunity.id, to: 'SIGNING', eventType: 'document.created', ...createdEvent, proofRef: envelope.externalId })
+  }
+  if (config.DEMO_HYBRID_MODE && (!review.live || !envelope.live)) {
+    const timestamps = mockDocumentEvidenceTimestamps(acceptance.occurredAt)
+    await recordOwnerSignature(demoRunId)
+    await db.document.update({
+      where: { provider_externalId: { provider: Provider.DOCUMENSO, externalId: data.envelopeId } },
+      data: { ...timestamps, status: 'COMPLETED' },
+    })
+    await appendRunEventOnce(demoRunId, {
+      opportunityId: opportunity.id,
+      type: 'owner.signed',
+      status: 'SIGNING',
+      summary: 'MOCK/DEMO owner-first signature step recorded; no real signature was made.',
+      actor: 'mock-demo',
+      proofRef: `${envelope.externalId}:mock-owner`,
+    })
+    await transitionOpportunity({
+      opportunityId: opportunity.id,
+      to: 'SIGNED',
+      eventType: 'document.completed',
+      summary: 'MOCK/DEMO buyer-second signature step recorded; no real signatures or legal review occurred.',
+      actor: 'mock-demo',
+      proofRef: `${envelope.externalId}:mock-complete`,
+    })
+    await db.demoRun.update({ where: { id: demoRunId }, data: { status: DemoRunStatus.COMPLETE, completedAt: timestamps.completedAt } })
+    await appendRunEventOnce(demoRunId, {
+      type: 'demo.completed',
+      status: 'COMPLETE',
+      summary: 'MOCK/DEMO signing simulation completed in owner-first, buyer-second order.',
+      actor: 'mock-demo',
+      proofRef: `${envelope.externalId}:mock-demo-complete`,
+    })
+    return
   }
   await db.demoRun.update({ where: { id: demoRunId }, data: { status: DemoRunStatus.AWAITING_OWNER_SIGNATURE } })
 }

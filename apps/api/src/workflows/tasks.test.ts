@@ -3,25 +3,44 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => {
   const db = {
-    demoRun: { findUniqueOrThrow: vi.fn(), updateMany: vi.fn() },
+    demoRun: { findUniqueOrThrow: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
     providerAction: { upsert: vi.fn() },
     humanStudy: { findUnique: vi.fn(), upsert: vi.fn() },
     campaignRevision: { updateMany: vi.fn() },
     event: { findFirst: vi.fn() },
+    opportunity: { findFirstOrThrow: vi.fn() },
+    providerEvent: { findUnique: vi.fn() },
+    document: { upsert: vi.fn(), update: vi.fn() },
+    approval: { upsert: vi.fn() },
     $transaction: vi.fn(),
   }
   return {
     db,
     dispatchProviderAction: vi.fn(),
     appendRunEvent: vi.fn(),
+    recordOwnerSignature: vi.fn(),
+    transitionOpportunity: vi.fn(),
+    createTeracContractReviewProvider: vi.fn(),
+    config: {
+      DEMO_HYBRID_MODE: false,
+      DOCUMENSO_BUYER_EMAIL: 'anja@nordlicht.example' as string | undefined,
+      LINQ_NORDLICHT_RECIPIENT: 'anja@nordlicht.example',
+    },
   }
 })
 
 vi.mock('../db.js', () => ({ db: mocks.db }))
 vi.mock('../outbox.js', () => ({ dispatchProviderAction: mocks.dispatchProviderAction }))
+vi.mock('../config.js', () => ({
+  getConfig: () => mocks.config,
+}))
+vi.mock('../providers/registry.js', () => ({
+  createTeracContractReviewProvider: mocks.createTeracContractReviewProvider,
+}))
 vi.mock('../domain/demo-service.js', () => ({
   appendRunEvent: mocks.appendRunEvent,
-  transitionOpportunity: vi.fn(),
+  recordOwnerSignature: mocks.recordOwnerSignature,
+  transitionOpportunity: mocks.transitionOpportunity,
 }))
 
 import {
@@ -29,12 +48,16 @@ import {
   assertTeracStudyBoundToRevisions,
   bandRequestFromInbound,
   consentedLinqRequest,
+  contractDocumentCreatedEvent,
   documensoBuyerFromLinqAcceptance,
   documensoEnvelopeRequest,
   evaluateBandVerdict,
+  mockDocumentEvidenceTimestamps,
   recipientFingerprint,
+  reviewContractAndCreateEnvelope,
   resolveMonidCompanyMatch,
   runTeracCampaignStudy,
+  teracStudyCompletionEvent,
 } from './tasks.js'
 
 const company = {
@@ -115,6 +138,198 @@ describe('Terac workflow proof binding', () => {
   })
 })
 
+describe('hybrid workflow timeline truthfulness', () => {
+  it('attributes a live campaign study to Terac', () => {
+    expect(teracStudyCompletionEvent(true, 'Candidate B', 31)).toEqual({
+      summary: 'Terac selected Candidate B with a 31.00-point average lift.',
+      actor: 'terac',
+    })
+  })
+
+  it('labels a mock campaign route without claiming human Terac respondents', () => {
+    const event = teracStudyCompletionEvent(false, 'Candidate B', 31)
+
+    expect(event).toEqual({
+      summary: 'Mock demo route selected Candidate B with a 31.00-point average lift; no human Terac study was run.',
+      actor: 'mock-demo',
+    })
+    expect(event.summary).not.toMatch(/Terac selected|human respondents/i)
+  })
+
+  it('uses provider attribution only when contract review and envelope creation are live', () => {
+    expect(contractDocumentCreatedEvent(true, true)).toEqual({
+      summary: 'Terac contract review completed for German-law clauses; Documenso started owner-first sequential signing.',
+      actor: 'documenso',
+    })
+  })
+
+  it.each([
+    [false, true],
+    [true, false],
+    [false, false],
+  ])('labels contract and document presentation as mock when review=%s and envelope=%s', (reviewLive, envelopeLive) => {
+    const event = contractDocumentCreatedEvent(reviewLive, envelopeLive)
+
+    expect(event).toEqual({
+      summary: 'Mock, non-legal contract review completed; mock Documenso demo started owner-first sequential signing.',
+      actor: 'mock-demo',
+    })
+    expect(event.summary).not.toMatch(/German counsel/i)
+  })
+
+  it('derives stable owner-first and buyer-second mock timestamps from acceptance', () => {
+    const evidence = mockDocumentEvidenceTimestamps(new Date('2026-08-15T10:00:00.000Z'))
+
+    expect(evidence).toEqual({
+      ownerSignedAt: new Date('2026-08-15T10:00:01.000Z'),
+      buyerSignedAt: new Date('2026-08-15T10:00:02.000Z'),
+      completedAt: new Date('2026-08-15T10:00:02.000Z'),
+    })
+    expect(evidence.ownerSignedAt.getTime()).toBeLessThan(evidence.buyerSignedAt.getTime())
+  })
+})
+
+describe('hybrid contract completion', () => {
+  const acceptanceTime = new Date('2026-08-15T10:00:00.000Z')
+  const opportunity = {
+    id: 'opp-nordlicht',
+    stage: 'AGREEMENT',
+    company,
+    contact: { ...contact, name: 'Anja Keller', addressHash: recipientFingerprint('anja@nordlicht.example') },
+  }
+  const acceptance = {
+    demoRunId: 'run-1',
+    opportunityId: opportunity.id,
+    type: 'agreement.accepted',
+    actor: 'linq',
+    proofRef: 'linq-acceptance-1',
+    occurredAt: acceptanceTime,
+  }
+  const receipt = {
+    demoRunId: 'run-1',
+    provider: Provider.LINQ,
+    externalEventId: 'linq-acceptance-1',
+    eventType: 'message.received',
+    processedAt: new Date('2026-08-15T10:00:00.500Z'),
+  }
+  const reviewProvider = { provider: Provider.TERAC }
+
+  function providerResult(provider: Provider, externalId: string, live: boolean, data: Record<string, unknown>) {
+    return { provider, externalId, live, status: 'COMPLETED', data, redacted: {} }
+  }
+
+  beforeEach(() => {
+    vi.resetAllMocks()
+    mocks.config.DEMO_HYBRID_MODE = false
+    mocks.config.DOCUMENSO_BUYER_EMAIL = 'anja@nordlicht.example'
+    mocks.createTeracContractReviewProvider.mockReturnValue(reviewProvider)
+    mocks.db.opportunity.findFirstOrThrow.mockResolvedValue(opportunity)
+    mocks.db.event.findFirst.mockResolvedValueOnce(acceptance).mockResolvedValue(null)
+    mocks.db.providerEvent.findUnique.mockResolvedValue(receipt)
+    mocks.db.providerAction.upsert
+      .mockResolvedValueOnce({ id: 'review-action' })
+      .mockResolvedValueOnce({ id: 'envelope-action' })
+    mocks.db.document.upsert.mockResolvedValue({ id: 'document-1' })
+  })
+
+  it('completes a mock envelope with ordered simulated evidence and explicit demo events', async () => {
+    mocks.config.DEMO_HYBRID_MODE = true
+    mocks.config.DOCUMENSO_BUYER_EMAIL = undefined
+    mocks.db.providerEvent.findUnique.mockResolvedValue({
+      ...receipt,
+      processedAt: null,
+      processingToken: 'linq-processing-lease',
+    })
+    mocks.dispatchProviderAction
+      .mockResolvedValueOnce(providerResult(Provider.TERAC, 'terac:mock-review', false, { status: 'COMPLETE' }))
+      .mockResolvedValueOnce(providerResult(Provider.DOCUMENSO, 'documenso:mock-envelope', false, {
+        envelopeId: 'mock-envelope',
+        status: 'CREATED',
+      }))
+
+    await reviewContractAndCreateEnvelope('run-1', new Map())
+
+    expect(mocks.recordOwnerSignature).toHaveBeenCalledWith('run-1')
+    expect(mocks.db.document.update).toHaveBeenCalledWith({
+      where: { provider_externalId: { provider: Provider.DOCUMENSO, externalId: 'mock-envelope' } },
+      data: {
+        ownerSignedAt: new Date('2026-08-15T10:00:01.000Z'),
+        buyerSignedAt: new Date('2026-08-15T10:00:02.000Z'),
+        completedAt: new Date('2026-08-15T10:00:02.000Z'),
+        status: 'COMPLETED',
+      },
+    })
+    expect(mocks.transitionOpportunity).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      to: 'SIGNING',
+      summary: expect.stringMatching(/Mock, non-legal.*mock Documenso/i),
+      actor: 'mock-demo',
+    }))
+    expect(mocks.transitionOpportunity).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      to: 'SIGNED',
+      summary: expect.stringMatching(/MOCK\/DEMO.*no real signatures or legal review/i),
+      actor: 'mock-demo',
+    }))
+    expect(mocks.db.demoRun.update).toHaveBeenCalledWith({
+      where: { id: 'run-1' },
+      data: { status: DemoRunStatus.COMPLETE, completedAt: new Date('2026-08-15T10:00:02.000Z') },
+    })
+    expect(mocks.appendRunEvent).toHaveBeenCalledTimes(2)
+    expect(mocks.appendRunEvent).toHaveBeenCalledWith('run-1', expect.objectContaining({
+      type: 'owner.signed',
+      summary: expect.stringMatching(/MOCK\/DEMO.*no real signature/i),
+      actor: 'mock-demo',
+    }))
+    expect(mocks.appendRunEvent).toHaveBeenCalledWith('run-1', expect.objectContaining({
+      type: 'demo.completed',
+      summary: expect.stringMatching(/MOCK\/DEMO signing simulation/i),
+      actor: 'mock-demo',
+    }))
+  })
+
+  it('keeps a fully live envelope awaiting the real owner signature', async () => {
+    mocks.dispatchProviderAction
+      .mockResolvedValueOnce(providerResult(Provider.TERAC, 'terac:live-review', true, { status: 'COMPLETE' }))
+      .mockResolvedValueOnce(providerResult(Provider.DOCUMENSO, 'documenso:live-envelope', true, {
+        envelopeId: 'live-envelope',
+        status: 'CREATED',
+      }))
+
+    await reviewContractAndCreateEnvelope('run-1', new Map())
+
+    expect(mocks.transitionOpportunity).toHaveBeenCalledOnce()
+    expect(mocks.transitionOpportunity).toHaveBeenCalledWith(expect.objectContaining({
+      to: 'SIGNING',
+      summary: expect.stringMatching(/Terac contract review.*Documenso started/i),
+      actor: 'documenso',
+    }))
+    expect(mocks.recordOwnerSignature).not.toHaveBeenCalled()
+    expect(mocks.db.document.update).not.toHaveBeenCalled()
+    expect(mocks.db.demoRun.update).toHaveBeenCalledWith({
+      where: { id: 'run-1' },
+      data: { status: DemoRunStatus.AWAITING_OWNER_SIGNATURE },
+    })
+  })
+
+  it('does not auto-sign non-live results outside explicit hybrid mode', async () => {
+    mocks.dispatchProviderAction
+      .mockResolvedValueOnce(providerResult(Provider.TERAC, 'terac:mock-review', false, { status: 'COMPLETE' }))
+      .mockResolvedValueOnce(providerResult(Provider.DOCUMENSO, 'documenso:mock-envelope', false, {
+        envelopeId: 'mock-envelope',
+        status: 'CREATED',
+      }))
+
+    await reviewContractAndCreateEnvelope('run-1', new Map())
+
+    expect(mocks.recordOwnerSignature).not.toHaveBeenCalled()
+    expect(mocks.db.document.update).not.toHaveBeenCalled()
+    expect(mocks.transitionOpportunity).toHaveBeenCalledOnce()
+    expect(mocks.db.demoRun.update).toHaveBeenCalledWith({
+      where: { id: 'run-1' },
+      data: { status: DemoRunStatus.AWAITING_OWNER_SIGNATURE },
+    })
+  })
+})
+
 describe('Terac study completion replay', () => {
   const providerResult = {
     externalId: 'terac-study-1',
@@ -154,11 +369,12 @@ describe('Terac study completion replay', () => {
     runStatus: DemoRunStatus,
     winnerStatus: RevisionStatus,
     durableEvidence: typeof expectedEvidence | null,
+    mode: 'FAKE' | 'JUDGE' = 'FAKE',
   ) {
     const state = { runStatus, winnerStatus, durableEvidence }
     mocks.db.demoRun.findUniqueOrThrow.mockResolvedValue({
       id: 'run-1',
-      mode: 'FAKE',
+      mode,
       status: runStatus,
       campaign: {
         revisions: [
@@ -187,7 +403,7 @@ describe('Terac study completion replay', () => {
   }
 
   beforeEach(() => {
-    vi.clearAllMocks()
+    vi.resetAllMocks()
     mocks.db.$transaction.mockImplementation(async (callback) => callback(mocks.db))
     mocks.db.providerAction.upsert.mockResolvedValue({ id: 'provider-action-1' })
     mocks.dispatchProviderAction.mockResolvedValue(providerResult)
@@ -203,7 +419,24 @@ describe('Terac study completion replay', () => {
     expect(state.winnerStatus).toBe(RevisionStatus.READY_FOR_APPROVAL)
     expect(state.durableEvidence).toEqual(expectedEvidence)
     expect(mocks.db.humanStudy.upsert).toHaveBeenCalledTimes(1)
-    expect(mocks.appendRunEvent).toHaveBeenCalledTimes(1)
+    expect(mocks.appendRunEvent).toHaveBeenCalledWith('run-1', expect.objectContaining({
+      type: 'study.completed',
+      summary: expect.stringMatching(/Mock demo route.*no human Terac study was run/i),
+      actor: 'mock-demo',
+    }))
+  })
+
+  it('uses live Terac attribution for a live campaign result', async () => {
+    configureState(DemoRunStatus.STUDY_RUNNING, RevisionStatus.UNDER_STUDY, null)
+    mocks.dispatchProviderAction.mockResolvedValue({ ...providerResult, live: true })
+
+    await runTeracCampaignStudy('run-1', new Map())
+
+    expect(mocks.appendRunEvent).toHaveBeenCalledWith('run-1', expect.objectContaining({
+      type: 'study.completed',
+      summary: 'Terac selected Candidate B with a 31.00-point average lift.',
+      actor: 'terac',
+    }))
   })
 
   it('returns successfully after approval without demoting the active revision or run', async () => {
@@ -239,6 +472,17 @@ describe('Terac study completion replay', () => {
     expect(state.runStatus).toBe(DemoRunStatus.RUNNING)
     expect(state.winnerStatus).toBe(RevisionStatus.ACTIVE)
     expect(mocks.db.campaignRevision.updateMany).not.toHaveBeenCalled()
+  })
+
+  it('rejects mock Terac respondent proof in a judged run', async () => {
+    const state = configureState(DemoRunStatus.STUDY_RUNNING, RevisionStatus.UNDER_STUDY, null, 'JUDGE')
+
+    await expect(runTeracCampaignStudy('run-1', new Map())).rejects.toThrow(/must be live.*mock respondent proof/i)
+
+    expect(state.runStatus).toBe(DemoRunStatus.STUDY_RUNNING)
+    expect(state.winnerStatus).toBe(RevisionStatus.UNDER_STUDY)
+    expect(mocks.db.$transaction).not.toHaveBeenCalled()
+    expect(mocks.appendRunEvent).not.toHaveBeenCalled()
   })
 })
 
@@ -307,6 +551,29 @@ describe('Documenso buyer consent evidence', () => {
       buyerEmail,
       acceptance,
       { ...receipt, processedAt: null },
+      { demoRunId: 'run-1', opportunityId: 'opp-nordlicht' },
+    )).toThrow(/processed Linq acceptance receipt/)
+  })
+
+  it('accepts the exact durably in-flight receipt only for hybrid inline processing', () => {
+    const inFlightReceipt = { ...receipt, processedAt: null, processingToken: 'linq-processing-lease' }
+
+    expect(documensoBuyerFromLinqAcceptance(
+      buyerContact,
+      buyerEmail,
+      acceptance,
+      inFlightReceipt,
+      { demoRunId: 'run-1', opportunityId: 'opp-nordlicht', allowInFlightReceipt: true },
+    )).toEqual({
+      name: 'Anja Keller',
+      identityRole: 'buyer',
+      consentedAt: '2026-08-15T10:00:03.000Z',
+    })
+    expect(() => documensoBuyerFromLinqAcceptance(
+      buyerContact,
+      buyerEmail,
+      acceptance,
+      inFlightReceipt,
       { demoRunId: 'run-1', opportunityId: 'opp-nordlicht' },
     )).toThrow(/processed Linq acceptance receipt/)
   })

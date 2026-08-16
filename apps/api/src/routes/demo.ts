@@ -26,6 +26,22 @@ interface PublicReconciliationState {
 
 const publicReconciliations = new Map<string, PublicReconciliationState>()
 
+function requiredRunMode(): RunMode {
+  const config = getConfig()
+  if (config.DEMO_HYBRID_MODE) return RunMode.FAKE
+  return config.PROVIDER_MODE === 'real' ? RunMode.JUDGE : RunMode.FAKE
+}
+
+function assertActionRunMode(mode: RunMode): void {
+  const expectedMode = requiredRunMode()
+  if (mode !== expectedMode) {
+    const message = expectedMode === RunMode.JUDGE
+      ? 'Real provider actions require a JUDGE run'
+      : 'This deployment only accepts FAKE runs'
+    throw httpError(409, message)
+  }
+}
+
 function reconcilePublicDemoRun(demoRunId: string): Promise<void> {
   let state = publicReconciliations.get(demoRunId)
   if (state?.inFlight) return state.inFlight
@@ -131,7 +147,7 @@ export function registerDemoRoutes(app: FastifyInstance): void {
 
   app.post('/api/v1/demo-runs', { preHandler: requireOwner }, async (request, reply) => {
     const input = createDemoRunSchema.parse(request.body ?? {})
-    const expectedMode = getConfig().PROVIDER_MODE === 'real' ? RunMode.JUDGE : RunMode.FAKE
+    const expectedMode = requiredRunMode()
     if (input.mode !== expectedMode) {
       throw httpError(409, `This deployment only accepts ${expectedMode} runs`)
     }
@@ -140,6 +156,9 @@ export function registerDemoRoutes(app: FastifyInstance): void {
   })
 
   app.post<{ Params: { id: string } }>('/api/v1/demo-runs/:id/rehearse', { preHandler: requireOwner }, async (request) => {
+    if (getConfig().DEMO_HYBRID_MODE) {
+      throw httpError(409, 'Fake rehearsal is unavailable in hybrid mode')
+    }
     try {
       await runFakeRehearsal(request.params.id)
     } catch (error) {
@@ -153,11 +172,8 @@ export function registerDemoRoutes(app: FastifyInstance): void {
 
   app.post<{ Params: { id: string } }>('/api/v1/demo-runs/:id/campaign-decision', { preHandler: requireOwner }, async (request) => {
     const input = ownerDecisionSchema.parse(request.body)
-    const config = getConfig()
     const run = await db.demoRun.findUniqueOrThrow({ where: { id: request.params.id }, select: { mode: true } })
-    if (config.PROVIDER_MODE === 'real' && run.mode !== RunMode.JUDGE) {
-      throw httpError(409, 'Real provider actions require a JUDGE run')
-    }
+    assertActionRunMode(run.mode)
     if (input.decision === 'APPROVE') {
       const approval = await db.approval.findUnique({
         where: { demoRunId_kind: { demoRunId: request.params.id, kind: ApprovalKind.CAMPAIGN } },
@@ -166,7 +182,7 @@ export function registerDemoRoutes(app: FastifyInstance): void {
       else if (approval.decision !== ApprovalDecision.APPROVE) {
         throw httpError(409, 'Campaign was already rejected and cannot be approved on retry')
       }
-      if (config.PROVIDER_MODE === 'real') {
+      if (getConfig().PROVIDER_MODE === 'real' || getConfig().DEMO_HYBRID_MODE) {
         await Promise.all(approvedRenderTasks.map((slug) => triggerRenderTask(request.params.id, slug)))
       }
     } else {

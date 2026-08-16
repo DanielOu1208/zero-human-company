@@ -234,6 +234,20 @@ type ProviderReceiptClaimOptions = {
 const providerReceiptStore = db.providerEvent as unknown as ProviderReceiptStore
 const PROVIDER_RECEIPT_LEASE_MS = 15 * 60 * 1_000
 
+function assertProviderActionRunMode(mode: RunMode): void {
+  const config = getConfig()
+  const expectedMode = config.DEMO_HYBRID_MODE || config.PROVIDER_MODE !== 'real'
+    ? RunMode.FAKE
+    : RunMode.JUDGE
+  if (mode === expectedMode) return
+  if (expectedMode === RunMode.JUDGE) {
+    throw httpError(409, 'Real provider actions require a JUDGE run')
+  }
+  throw httpError(409, config.DEMO_HYBRID_MODE
+    ? 'Hybrid provider actions require a FAKE run'
+    : 'Fake provider actions require a FAKE run')
+}
+
 function isUniqueViolation(error: unknown): boolean {
   return (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002')
     || (typeof error === 'object' && error !== null && 'code' in error && (error as { code?: unknown }).code === 'P2002')
@@ -387,9 +401,7 @@ export function inboundMessageBody(input: { optedOut: boolean; companyName: stri
 export function registerProviderRoutes(app: FastifyInstance): void {
   app.post<{ Params: { id: string } }>('/api/v1/demo-runs/:id/activate', { preHandler: requireOwner }, async (request) => {
     const run = await db.demoRun.findUniqueOrThrow({ where: { id: request.params.id }, include: { workspace: { include: { pilotActivation: true } } } })
-    if (getConfig().PROVIDER_MODE === 'real' && run.mode !== RunMode.JUDGE) {
-      throw httpError(409, 'Real provider actions require a JUDGE run')
-    }
+    assertProviderActionRunMode(run.mode)
     const pilot = run.workspace.pilotActivation
     if (!pilot || run.status !== DemoRunStatus.AWAITING_PAYMENT) throw httpError(409, 'Run is not awaiting pilot payment')
     const action = await db.providerAction.upsert({
@@ -638,9 +650,7 @@ export function registerProviderRoutes(app: FastifyInstance): void {
     const opportunityStages = Object.fromEntries(
       run.opportunities.map((opportunity) => [opportunity.company.name, opportunity.stage]),
     ) as ManualTaskPhase['opportunityStages']
-    if (getConfig().PROVIDER_MODE === 'real' && run.mode !== RunMode.JUDGE) {
-      throw httpError(409, 'Real provider actions require a JUDGE run')
-    }
+    assertProviderActionRunMode(run.mode)
     assertManualTaskPhase(slug, {
       runStatus: run.status,
       pilotStatus: run.workspace.pilotActivation?.status ?? null,

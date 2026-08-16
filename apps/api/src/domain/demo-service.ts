@@ -246,7 +246,9 @@ export async function decideCampaign(
   await appendRunEvent(demoRunId, {
     type: 'campaign.approved',
     status: 'RUNNING',
-    summary: 'Owner approved the human-selected campaign revision. Autonomous work may begin.',
+    summary: getConfig().DEMO_HYBRID_MODE
+      ? 'Owner approved the mock demo-selected campaign revision. Connected provider work may begin.'
+      : 'Owner approved the human-selected campaign revision. Autonomous work may begin.',
     actor: 'owner',
   })
 }

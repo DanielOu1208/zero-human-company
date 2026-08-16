@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   findApproval: vi.fn(),
   findDemoRun: vi.fn(),
   getDemoRunSnapshot: vi.fn(),
+  hybridMode: false,
   providerMode: 'fake',
   reconcilePendingRenderTaskRuns: vi.fn(),
   runFakeRehearsal: vi.fn(),
@@ -18,7 +19,9 @@ const mocks = vi.hoisted(() => ({
 }))
 
 vi.mock('../auth.js', () => ({ requireOwner: vi.fn() }))
-vi.mock('../config.js', () => ({ getConfig: () => ({ PROVIDER_MODE: mocks.providerMode }) }))
+vi.mock('../config.js', () => ({
+  getConfig: () => ({ PROVIDER_MODE: mocks.providerMode, DEMO_HYBRID_MODE: mocks.hybridMode }),
+}))
 vi.mock('../db.js', () => ({
   db: {
     approval: { findUnique: mocks.findApproval },
@@ -123,6 +126,7 @@ function reply(writes: string[] = []): TestReply {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  mocks.hybridMode = false
   mocks.providerMode = 'fake'
   mocks.collectProof.mockResolvedValue([])
   mocks.createDemoRun.mockResolvedValue('created-run')
@@ -159,6 +163,35 @@ describe('deployment run-mode gates', () => {
     expect(mocks.createDemoRun).toHaveBeenLastCalledWith('JUDGE')
   })
 
+  it('accepts only FAKE run creation in hybrid mode even when provider mode is real', async () => {
+    mocks.hybridMode = true
+    mocks.providerMode = 'real'
+    const handler = registeredRoutes().get('/api/v1/demo-runs')!
+
+    await handler({ ...request(''), body: { mode: 'FAKE' } }, reply())
+    expect(mocks.createDemoRun).toHaveBeenCalledWith('FAKE')
+
+    await expect(handler({ ...request(''), body: { mode: 'JUDGE' } }, reply())).rejects.toMatchObject({
+      statusCode: 409,
+      message: 'This deployment only accepts FAKE runs',
+    })
+  })
+
+  it('forbids all-fake rehearsal in hybrid mode and preserves it in ordinary fake mode', async () => {
+    const handler = registeredRoutes().get('/api/v1/demo-runs/:id/rehearse')!
+    mocks.hybridMode = true
+
+    await expect(handler(request('hybrid-run'), reply())).rejects.toMatchObject({
+      statusCode: 409,
+      message: 'Fake rehearsal is unavailable in hybrid mode',
+    })
+    expect(mocks.runFakeRehearsal).not.toHaveBeenCalled()
+
+    mocks.hybridMode = false
+    await handler(request('fake-run'), reply())
+    expect(mocks.runFakeRehearsal).toHaveBeenCalledWith('fake-run')
+  })
+
   it.each(['APPROVE', 'REJECT'] as const)('rejects a FAKE campaign %s in real mode before persistence or Render dispatch', async (decision) => {
     mocks.providerMode = 'real'
     mocks.findDemoRun.mockResolvedValueOnce({ mode: 'FAKE' })
@@ -192,6 +225,22 @@ describe('deployment run-mode gates', () => {
 
     expect(mocks.decideCampaign).toHaveBeenCalledWith('fake-run', 'APPROVE')
     expect(mocks.triggerRenderTask).not.toHaveBeenCalled()
+  })
+
+  it('dispatches approved FAKE campaigns inline in hybrid mode and rejects JUDGE campaigns', async () => {
+    mocks.hybridMode = true
+    mocks.providerMode = 'real'
+    mocks.findApproval.mockResolvedValue({ decision: 'APPROVE' })
+    const handler = registeredRoutes().get('/api/v1/demo-runs/:id/campaign-decision')!
+
+    await handler({ ...request('fake-run'), body: { decision: 'APPROVE' } }, reply())
+    expect(mocks.triggerRenderTask).toHaveBeenCalledTimes(3)
+
+    mocks.findDemoRun.mockResolvedValueOnce({ mode: 'JUDGE' })
+    await expect(handler({ ...request('judge-run'), body: { decision: 'APPROVE' } }, reply())).rejects.toMatchObject({
+      statusCode: 409,
+      message: 'This deployment only accepts FAKE runs',
+    })
   })
 })
 

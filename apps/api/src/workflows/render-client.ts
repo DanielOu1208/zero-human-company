@@ -111,6 +111,135 @@ async function winningExternalId(intentId: string, slug: WorkflowTaskSlug): Prom
   throw new Error(`Render task ${slug} is already being triggered; retry reconciliation shortly`)
 }
 
+async function triggerInlineTask(
+  intent: Awaited<ReturnType<typeof db.renderTaskIntent.upsert>>,
+  demoRunId: string,
+  slug: WorkflowTaskSlug,
+): Promise<string> {
+  if (intent.externalId && !intent.externalId.startsWith('inline:')) return intent.externalId
+
+  const now = new Date()
+  const staleInlineExecution = intent.externalId
+    && intent.triggerStatus === RenderTaskTriggerStatus.TRIGGERING
+    && intent.leaseExpiresAt !== null
+    && intent.leaseExpiresAt <= now
+  if (
+    intent.externalId
+    && intent.triggerStatus !== RenderTaskTriggerStatus.FAILED
+    && !staleInlineExecution
+  ) return intent.externalId
+  const triggerToken = randomUUID()
+  const externalId = intent.externalId ?? `inline:${intent.id}`
+  const claimed = await db.renderTaskIntent.updateMany({
+    where: {
+      id: intent.id,
+      externalId: intent.externalId,
+      ...(intent.externalId
+        ? {
+            OR: [
+              {
+                triggerStatus: RenderTaskTriggerStatus.FAILED,
+                OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { lte: now } }],
+              },
+              { triggerStatus: RenderTaskTriggerStatus.TRIGGERING, leaseExpiresAt: { lte: now } },
+            ],
+          }
+        : {
+            OR: [
+              { triggerStatus: RenderTaskTriggerStatus.PLANNED },
+              {
+                triggerStatus: RenderTaskTriggerStatus.FAILED,
+                OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { lt: now } }],
+              },
+              { triggerStatus: RenderTaskTriggerStatus.TRIGGERING, leaseExpiresAt: { lt: now } },
+            ],
+          }),
+    },
+    data: {
+      triggerStatus: RenderTaskTriggerStatus.TRIGGERING,
+      triggerAttempts: { increment: 1 },
+      triggerToken,
+      leaseExpiresAt: new Date(now.getTime() + triggerLeaseMs),
+      lastError: null,
+    },
+  })
+  if (claimed.count === 0) return winningExternalId(intent.id, slug)
+
+  try {
+    const demoRun = await db.demoRun.findUniqueOrThrow({
+      where: { id: demoRunId },
+      select: { workspace: { select: { killSwitch: true } } },
+    })
+    if (demoRun.workspace.killSwitch) throw new Error(workspaceKillSwitchError)
+
+    if (!intent.externalId) {
+      const persisted = await db.renderTaskIntent.updateMany({
+        where: { id: intent.id, triggerToken, externalId: null },
+        data: { externalId },
+      })
+      if (persisted.count === 0) return winningExternalId(intent.id, slug)
+    }
+
+    await db.workflowRun.upsert({
+      where: { provider_externalId: { provider: 'RENDER', externalId } },
+      create: {
+        demoRunId,
+        externalId,
+        taskSlug: slug,
+        live: false,
+        status: 'RUNNING',
+        attempt: 1,
+        retried: false,
+      },
+      update: {},
+    })
+    if (intent.externalId) {
+      await db.workflowRun.updateMany({
+        where: { provider: 'RENDER', externalId, status: { in: ['FAILED', 'RUNNING'] } },
+        data: { status: 'RUNNING', attempt: { increment: 1 }, retried: true },
+      })
+    }
+
+    const [{ executeWorkflowTask }, { createProviderRegistry }] = await Promise.all([
+      import('./tasks.js'),
+      import('../providers/registry.js'),
+    ])
+    await executeWorkflowTask(slug, demoRunId, createProviderRegistry())
+    await db.workflowRun.updateMany({
+      where: { provider: 'RENDER', externalId, status: { notIn: terminalRunStatuses } },
+      data: { status: 'COMPLETED' },
+    })
+    await db.renderTaskIntent.updateMany({
+      where: { id: intent.id, externalId, triggerToken },
+      data: {
+        triggerStatus: RenderTaskTriggerStatus.TRIGGERED,
+        triggerToken: null,
+        leaseExpiresAt: null,
+        lastError: null,
+      },
+    })
+    return externalId
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown inline workflow trigger error'
+    await Promise.all([
+      db.workflowRun.updateMany({
+        where: { provider: 'RENDER', externalId, status: { notIn: terminalRunStatuses } },
+        data: { status: 'FAILED' },
+      }),
+      db.renderTaskIntent.updateMany({
+        where: { id: intent.id, triggerToken },
+        data: {
+          triggerStatus: RenderTaskTriggerStatus.FAILED,
+          triggerToken: null,
+          lastError: message,
+          leaseExpiresAt: null,
+        },
+      }),
+    ])
+    throw error
+  }
+}
+
 async function discoverMatchingRun(
   render: RenderClient,
   demoRunId: string,
@@ -175,6 +304,7 @@ export async function reconcilePendingRenderTaskRuns(demoRunId?: string): Promis
   const pending = [] as Array<{ id: string; demoRunId: string; taskSlug: string; externalId: string }>
   for (const intent of intents) {
     if (!intent.externalId) continue
+    if (intent.externalId.startsWith('inline:')) continue
     const proof = await db.workflowRun.findUnique({
       where: { provider_externalId: { provider: 'RENDER', externalId: intent.externalId } },
       select: { status: true },
@@ -221,6 +351,7 @@ export async function triggerRenderTask(demoRunId: string, slug: WorkflowTaskSlu
     create: { demoRunId, taskSlug: slug },
     update: {},
   })
+  if (getConfig().DEMO_HYBRID_MODE) return triggerInlineTask(intent, demoRunId, slug)
   const render = configuredRenderClient()
 
   if (intent.externalId) {

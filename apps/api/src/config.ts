@@ -32,6 +32,7 @@ const configSchema = z.object({
   OWNER_EMAIL: z.string().email().default(localAuthDefaults.OWNER_EMAIL),
   OWNER_PASSWORD: z.string().min(8).default(localAuthDefaults.OWNER_PASSWORD),
   JUDGE_MODE: booleanFromEnv,
+  DEMO_HYBRID_MODE: booleanFromEnv,
   REAL_ACTIONS_ENABLED: booleanFromEnv,
   PROVIDER_MODE: z.enum(['fake', 'real']).default('fake'),
   OPENROUTER_API_KEY: optionalEnv(z.string()),
@@ -77,6 +78,31 @@ const configSchema = z.object({
   RENDER_OWNER_ID: optionalEnv(z.string()),
   RENDER_WORKFLOW_SLUG: optionalEnv(z.string()),
 }).superRefine((config, context) => {
+  if (config.JUDGE_MODE && config.DEMO_HYBRID_MODE) {
+    context.addIssue({
+      code: 'custom',
+      path: ['DEMO_HYBRID_MODE'],
+      message: 'DEMO_HYBRID_MODE must be false when JUDGE_MODE=true',
+    })
+  }
+
+  if (config.DEMO_HYBRID_MODE) {
+    if (config.PROVIDER_MODE !== 'real') {
+      context.addIssue({
+        code: 'custom',
+        path: ['PROVIDER_MODE'],
+        message: 'DEMO_HYBRID_MODE requires PROVIDER_MODE=real',
+      })
+    }
+    if (!config.REAL_ACTIONS_ENABLED) {
+      context.addIssue({
+        code: 'custom',
+        path: ['REAL_ACTIONS_ENABLED'],
+        message: 'DEMO_HYBRID_MODE requires REAL_ACTIONS_ENABLED=true',
+      })
+    }
+  }
+
   if (config.NODE_ENV !== 'production') return
 
   for (const key of Object.keys(localAuthDefaults) as Array<keyof typeof localAuthDefaults>) {

@@ -25,6 +25,8 @@ services:
         sync: false
       - key: JUDGE_MODE
         value: "false"
+      - key: DEMO_HYBRID_MODE
+        value: "false"
       - key: REAL_ACTIONS_ENABLED
         value: "false"
       - key: PROVIDER_MODE

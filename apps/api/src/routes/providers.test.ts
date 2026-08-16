@@ -6,6 +6,7 @@ const routeMocks = vi.hoisted(() => ({
   dispatchProviderAction: vi.fn(),
   findDemoRun: vi.fn(),
   getDemoRunSnapshot: vi.fn(),
+  hybridMode: false,
   providerActionUpsert: vi.fn(),
   providerMode: 'fake',
   triggerRenderTask: vi.fn(),
@@ -13,7 +14,9 @@ const routeMocks = vi.hoisted(() => ({
 }))
 
 vi.mock('../auth.js', () => ({ requireOwner: vi.fn() }))
-vi.mock('../config.js', () => ({ getConfig: () => ({ PROVIDER_MODE: routeMocks.providerMode }) }))
+vi.mock('../config.js', () => ({
+  getConfig: () => ({ PROVIDER_MODE: routeMocks.providerMode, DEMO_HYBRID_MODE: routeMocks.hybridMode }),
+}))
 vi.mock('../db.js', () => ({
   db: {
     demoRun: { findUniqueOrThrow: routeMocks.findDemoRun },
@@ -75,6 +78,7 @@ function eligibleRun(mode = RunMode.FAKE) {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  routeMocks.hybridMode = false
   routeMocks.providerMode = 'fake'
   routeMocks.findDemoRun.mockResolvedValue(eligibleRun())
   routeMocks.providerActionUpsert.mockResolvedValue({ id: 'provider-action-1' })
@@ -139,6 +143,18 @@ describe('provider route run-mode gates', () => {
     expect(routeMocks.triggerRenderTask).toHaveBeenCalledWith('run-1', 'discover-research-leads')
   })
 
+  it('keeps JUDGE manual tasks forbidden in ordinary fake mode', async () => {
+    routeMocks.findDemoRun.mockResolvedValueOnce(eligibleRun(RunMode.JUDGE))
+    const handler = registeredRoutes().get('/api/v1/demo-runs/:id/tasks/:slug')!
+
+    await expect(handler({ params: { id: 'run-1', slug: 'discover-research-leads' } }, {})).rejects.toMatchObject({
+      statusCode: 409,
+      message: 'Fake provider actions require a FAKE run',
+    })
+
+    expect(routeMocks.triggerRenderTask).not.toHaveBeenCalled()
+  })
+
   it('allows Stripe and manual Render actions for JUDGE runs in real mode', async () => {
     routeMocks.providerMode = 'real'
     routeMocks.findDemoRun
@@ -155,6 +171,43 @@ describe('provider route run-mode gates', () => {
 
     expect(routeMocks.dispatchProviderAction).toHaveBeenCalledTimes(1)
     expect(routeMocks.triggerRenderTask).toHaveBeenCalledWith('run-1', 'discover-research-leads')
+  })
+
+  it('allows only FAKE provider actions and inline task dispatch in hybrid mode', async () => {
+    routeMocks.hybridMode = true
+    routeMocks.providerMode = 'real'
+    routeMocks.findDemoRun
+      .mockResolvedValueOnce({
+        ...eligibleRun(),
+        status: DemoRunStatus.AWAITING_PAYMENT,
+        workspace: { pilotActivation: { id: 'pilot-1', status: PilotStatus.PENDING } },
+      })
+      .mockResolvedValueOnce(eligibleRun())
+    const routes = registeredRoutes()
+
+    await routes.get('/api/v1/demo-runs/:id/activate')!({ params: { id: 'run-1', slug: '' } }, {})
+    await routes.get('/api/v1/demo-runs/:id/tasks/:slug')!({
+      params: { id: 'run-1', slug: 'discover-research-leads' },
+    }, {})
+
+    expect(routeMocks.dispatchProviderAction).toHaveBeenCalledTimes(1)
+    expect(routeMocks.triggerRenderTask).toHaveBeenCalledWith('run-1', 'discover-research-leads')
+  })
+
+  it('rejects JUDGE provider actions in hybrid mode before dispatch', async () => {
+    routeMocks.hybridMode = true
+    routeMocks.providerMode = 'real'
+    routeMocks.findDemoRun.mockResolvedValue(eligibleRun(RunMode.JUDGE))
+    const routes = registeredRoutes()
+
+    await expect(routes.get('/api/v1/demo-runs/:id/tasks/:slug')!({
+      params: { id: 'run-1', slug: 'discover-research-leads' },
+    }, {})).rejects.toMatchObject({
+      statusCode: 409,
+      message: 'Hybrid provider actions require a FAKE run',
+    })
+
+    expect(routeMocks.triggerRenderTask).not.toHaveBeenCalled()
   })
 })
 
