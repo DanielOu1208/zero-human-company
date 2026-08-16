@@ -262,6 +262,7 @@ describe('Linq inbound target selection', () => {
     occurredAt: string
     runStatus?: DemoRunStatus
     stage?: OpportunityStage
+    stageReason?: string | null
   }) => ({
     id: overrides.id,
     demoRunId: overrides.demoRunId,
@@ -270,6 +271,7 @@ describe('Linq inbound target selection', () => {
     occurredAt: new Date(overrides.occurredAt),
     opportunity: {
       stage: overrides.stage ?? OpportunityStage.OUTREACH,
+      stageReason: overrides.stageReason ?? null,
       demoRun: { status: overrides.runStatus ?? DemoRunStatus.RUNNING },
       company: { name: 'Nordlicht Import GmbH' },
       contact: { consented: true, rolePlayer: true, addressHash: 'sender-fingerprint' },
@@ -307,6 +309,28 @@ describe('Linq inbound target selection', () => {
     const latest = candidate({ id: 'message-2', demoRunId: 'run-1', opportunityId: 'opportunity-1', occurredAt: '2026-08-15T11:00:00.000Z' })
 
     expect(selectEligibleLinqOutbound([first, latest], 'sender-fingerprint')).toEqual({ status: 'MATCHED', outbound: latest })
+  })
+
+  it('accepts a clarification only for a Band-escalated pause', () => {
+    const resumable = candidate({
+      id: 'paused-message',
+      demoRunId: 'run-1',
+      opportunityId: 'opportunity-1',
+      occurredAt: '2026-08-15T11:00:00.000Z',
+      stage: OpportunityStage.PAUSED,
+      stageReason: 'BAND_ESCALATE',
+    })
+    const policyBlocked = candidate({
+      id: 'policy-message',
+      demoRunId: 'run-2',
+      opportunityId: 'opportunity-2',
+      occurredAt: '2026-08-15T11:00:00.000Z',
+      stage: OpportunityStage.PAUSED,
+      stageReason: 'POLICY_BELOW_FLOOR',
+    })
+
+    expect(selectEligibleLinqOutbound([resumable], 'sender-fingerprint')).toEqual({ status: 'MATCHED', outbound: resumable })
+    expect(selectEligibleLinqOutbound([policyBlocked], 'sender-fingerprint')).toEqual({ status: 'UNMATCHED' })
   })
 })
 

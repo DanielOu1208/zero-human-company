@@ -156,7 +156,7 @@ export async function appendRunEvent(
 export async function transitionOpportunity(input: {
   opportunityId: string
   to: OpportunityStage
-  reason?: string
+  reason?: string | null
   eventType: string
   summary: string
   actor: string

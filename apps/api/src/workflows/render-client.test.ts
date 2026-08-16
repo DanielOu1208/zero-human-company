@@ -338,6 +338,48 @@ describe('durable Render task intent', () => {
     expect(mocks.executeWorkflowTask).toHaveBeenCalledTimes(1)
   })
 
+  it('runs a completed Band inline task once more and fences a concurrent repeat', async () => {
+    mocks.hybridMode = true
+    const externalId = 'inline:intent-1'
+    let intent = {
+      ...plannedIntent,
+      taskSlug: 'run-band-negotiation',
+      externalId,
+      triggerStatus: 'TRIGGERED',
+    }
+    mocks.db.renderTaskIntent.upsert.mockImplementation(async () => ({ ...intent }))
+    mocks.db.renderTaskIntent.updateMany.mockImplementation(async ({ where, data }) => {
+      if (data.triggerStatus === 'TRIGGERING') {
+        if (intent.triggerStatus !== 'TRIGGERED' || where.externalId !== externalId) return { count: 0 }
+        intent = { ...intent, ...data }
+        return { count: 1 }
+      }
+      if (where.triggerToken !== intent.triggerToken) return { count: 0 }
+      intent = { ...intent, ...data }
+      return { count: 1 }
+    })
+    mocks.db.renderTaskIntent.findUniqueOrThrow.mockImplementation(async () => ({ ...intent }))
+    mocks.db.workflowRun.findUnique.mockResolvedValue({ status: 'COMPLETED' })
+
+    let finishRepeat!: () => void
+    mocks.executeWorkflowTask.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      finishRepeat = resolve
+    }))
+
+    const repeat = triggerRenderTask('demo-1', 'run-band-negotiation')
+    await vi.waitFor(() => expect(mocks.executeWorkflowTask).toHaveBeenCalledTimes(1))
+    const concurrent = triggerRenderTask('demo-1', 'run-band-negotiation')
+    await expect(concurrent).resolves.toBe(externalId)
+    finishRepeat()
+    await expect(repeat).resolves.toBe(externalId)
+
+    expect(mocks.executeWorkflowTask).toHaveBeenCalledTimes(1)
+    expect(mocks.db.workflowRun.updateMany).toHaveBeenCalledWith({
+      where: { provider: 'RENDER', externalId, status: { in: ['COMPLETED'] } },
+      data: { status: 'RUNNING', attempt: { increment: 1 }, retried: true },
+    })
+  })
+
   it('marks hybrid workflow proof failed when inline execution fails', async () => {
     mocks.hybridMode = true
     mocks.executeWorkflowTask.mockRejectedValueOnce(new Error('inline task failed'))

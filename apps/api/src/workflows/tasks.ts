@@ -113,9 +113,9 @@ export function bandRequestFromInbound(sanitizedBody: string): BandNegotiationRe
   const brief = sanitizedBody.trim()
   if (!brief) throw new Error('Verified Linq inbound message has no usable sanitized body')
   return {
-    brief,
+    brief: `Seller context: the preceding outreach proposed a two-container furniture pilot at a EUR 172 per-seat target, subject to later contract review. Buyer reply: ${brief}`,
     currency: 'EUR',
-    localPolicy: 'Seller target EUR 172 per seat; hard floor EUR 158 per seat. Do not make binding legal claims. Local policy is authoritative.',
+    localPolicy: 'Seller target EUR 172 per seat; hard floor EUR 158 per seat. An affirmative reply to initial outreach is engagement, not binding acceptance. If the buyer is interested and made no below-floor counteroffer, recommend sending a non-binding EUR 172 proposal; quantity and legal terms may remain for contract review. Do not make binding legal claims. Local policy is authoritative.',
   }
 }
 
@@ -495,7 +495,8 @@ export async function runBandNegotiation(demoRunId: string, registry: ProviderRe
   })
   if (!inbound) throw new Error('Band negotiation requires a verified live Linq inbound on the opportunity thread')
   const bandRequest = bandRequestFromInbound(inbound.sanitizedBody)
-  const result = await plannedAction(registry, demoRunId, Provider.BAND, 'external-agents.negotiation', `band-negotiation:${demoRunId}:${opportunity.id}`, bandRequest)
+  const inboundKey = createHash('sha256').update(inbound.externalId ?? inbound.id).digest('hex').slice(0, 16)
+  const result = await plannedAction(registry, demoRunId, Provider.BAND, 'external-agents.negotiation', `band-negotiation:${demoRunId}:${opportunity.id}:${inboundKey}`, bandRequest)
   const parsed = bandNegotiationResultSchema.safeParse(result.data)
   if (!parsed.success) throw new Error(`Band returned malformed negotiation data: ${parsed.error.message}`)
   const data = parsed.data

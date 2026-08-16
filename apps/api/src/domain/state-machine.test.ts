@@ -6,6 +6,7 @@ describe('opportunity state machine', () => {
   it('allows only forward workflow transitions and terminal pauses', () => {
     expect(canTransition('ENGAGED', 'NEGOTIATING')).toBe(true)
     expect(canTransition('ENGAGED', 'SIGNED')).toBe(false)
+    expect(canTransition('PAUSED', 'ENGAGED')).toBe(true)
     expect(() => assertTransition('PAUSED', 'OUTREACH')).toThrow(/Invalid/)
   })
 

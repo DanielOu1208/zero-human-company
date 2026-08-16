@@ -96,7 +96,8 @@ export async function verifyDemoRun(runId: string): Promise<VerificationReport> 
     && item.kind === 'external-agents.negotiation'
     && item.live
     && item.status === 'SUCCEEDED'
-    && Boolean(item.providerExternalId))
+    && Boolean(item.providerExternalId)
+    && item.providerExternalId === nordlichtBandVerdict?.proofRef)
   const storedBandResult = record(bandAction?.redactedResponse)
   const bandSummary = record(storedBandResult?.summary)
   const bandData = record(storedBandResult?.data)
@@ -146,8 +147,9 @@ export async function verifyDemoRun(runId: string): Promise<VerificationReport> 
   const sameVerdict = storedVerdict.success
     && handoffVerdict.success
     && JSON.stringify(storedVerdict.data) === JSON.stringify(handoffVerdict.data)
+  const bandActionKeyPrefix = `band-negotiation:${runId}:${nordlicht?.id}`
   const loadBearingBandChain = Boolean(nordlicht && nordlichtBandVerdict && nordlichtProposal && nordlichtAcceptance)
-    && bandAction?.idempotencyKey === `band-negotiation:${runId}:${nordlicht?.id}`
+    && Boolean(bandAction && (bandAction.idempotencyKey === bandActionKeyPrefix || bandAction.idempotencyKey.startsWith(`${bandActionKeyPrefix}:`)))
     && nordlichtBandVerdict?.proofRef === bandAction?.providerExternalId
     && nordlichtProposal?.proofRef === proposalAction?.providerExternalId
     && Boolean(proposalMessage)

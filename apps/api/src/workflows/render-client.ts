@@ -119,6 +119,15 @@ async function triggerInlineTask(
   if (intent.externalId && !intent.externalId.startsWith('inline:')) return intent.externalId
 
   const now = new Date()
+  const completedBandRun = slug === 'run-band-negotiation'
+    && intent.externalId !== null
+    && intent.triggerStatus === RenderTaskTriggerStatus.TRIGGERED
+    && intent.triggerToken === null
+    && intent.leaseExpiresAt === null
+    && (await db.workflowRun.findUnique({
+      where: { provider_externalId: { provider: 'RENDER', externalId: intent.externalId } },
+      select: { status: true },
+    }))?.status === 'COMPLETED'
   const staleInlineExecution = intent.externalId
     && intent.triggerStatus === RenderTaskTriggerStatus.TRIGGERING
     && intent.leaseExpiresAt !== null
@@ -127,6 +136,7 @@ async function triggerInlineTask(
     intent.externalId
     && intent.triggerStatus !== RenderTaskTriggerStatus.FAILED
     && !staleInlineExecution
+    && !completedBandRun
   ) return intent.externalId
   const triggerToken = randomUUID()
   const externalId = intent.externalId ?? `inline:${intent.id}`
@@ -142,6 +152,13 @@ async function triggerInlineTask(
                 OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { lte: now } }],
               },
               { triggerStatus: RenderTaskTriggerStatus.TRIGGERING, leaseExpiresAt: { lte: now } },
+              ...(completedBandRun
+                ? [{
+                    triggerStatus: RenderTaskTriggerStatus.TRIGGERED,
+                    triggerToken: null,
+                    leaseExpiresAt: null,
+                  }]
+                : []),
             ],
           }
         : {
@@ -195,7 +212,11 @@ async function triggerInlineTask(
     })
     if (intent.externalId) {
       await db.workflowRun.updateMany({
-        where: { provider: 'RENDER', externalId, status: { in: ['FAILED', 'RUNNING'] } },
+        where: {
+          provider: 'RENDER',
+          externalId,
+          status: { in: completedBandRun ? ['COMPLETED'] : ['FAILED', 'RUNNING'] },
+        },
         data: { status: 'RUNNING', attempt: { increment: 1 }, retried: true },
       })
     }

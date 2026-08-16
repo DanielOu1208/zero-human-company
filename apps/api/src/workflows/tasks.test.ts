@@ -600,9 +600,9 @@ describe('Band workflow policy gate', () => {
   it('uses only the verified inbound body as the buyer brief', () => {
     const request = bandRequestFromInbound('Buyer asked to discuss delivery timing.')
     expect(request).toEqual({
-      brief: 'Buyer asked to discuss delivery timing.',
+      brief: 'Seller context: the preceding outreach proposed a two-container furniture pilot at a EUR 172 per-seat target, subject to later contract review. Buyer reply: Buyer asked to discuss delivery timing.',
       currency: 'EUR',
-      localPolicy: 'Seller target EUR 172 per seat; hard floor EUR 158 per seat. Do not make binding legal claims. Local policy is authoritative.',
+      localPolicy: 'Seller target EUR 172 per seat; hard floor EUR 158 per seat. An affirmative reply to initial outreach is engagement, not binding acceptance. If the buyer is interested and made no below-floor counteroffer, recommend sending a non-binding EUR 172 proposal; quantity and legal terms may remain for contract review. Do not make binding legal claims. Local policy is authoritative.',
     })
     expect(request).not.toHaveProperty('askingPrice')
     expect(request.brief).not.toMatch(/40HQ|boucl|German law/i)

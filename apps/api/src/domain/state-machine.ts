@@ -8,7 +8,7 @@ const transitions: Record<OpportunityStage, readonly OpportunityStage[]> = {
   AGREEMENT: ['SIGNING', 'PAUSED', 'LOST'],
   SIGNING: ['SIGNED', 'PAUSED', 'LOST'],
   SIGNED: [],
-  PAUSED: [],
+  PAUSED: ['ENGAGED'],
   LOST: [],
 }
 

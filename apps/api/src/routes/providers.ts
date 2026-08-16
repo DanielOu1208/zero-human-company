@@ -100,6 +100,7 @@ type LinqOutboundCandidate = {
   occurredAt: Date
   opportunity: {
     stage: OpportunityStage
+    stageReason: string | null
     demoRun: { status: DemoRunStatus }
     company: { name: string }
     contact: { consented: boolean; rolePlayer: boolean; addressHash: string | null } | null
@@ -116,6 +117,7 @@ const actionableNordlichtStages = new Set<OpportunityStage>([
   OpportunityStage.NEGOTIATING,
   OpportunityStage.AGREEMENT,
   OpportunityStage.SIGNING,
+  OpportunityStage.PAUSED,
 ])
 
 function isEligibleLinqOutbound(candidate: LinqOutboundCandidate, senderFingerprint: string): boolean {
@@ -125,6 +127,7 @@ function isEligibleLinqOutbound(candidate: LinqOutboundCandidate, senderFingerpr
   if (!contact?.consented || !contact.rolePlayer || contact.addressHash !== senderFingerprint) return false
   if (opportunity.company.name === 'Nordlicht Import GmbH') {
     return actionableNordlichtStages.has(opportunity.stage)
+      && (opportunity.stage !== OpportunityStage.PAUSED || opportunity.stageReason === 'BAND_ESCALATE')
   }
   return opportunity.company.name === 'Maas Interiors BV' && opportunity.stage === OpportunityStage.OUTREACH
 }
@@ -540,6 +543,9 @@ export function registerProviderRoutes(app: FastifyInstance): void {
         }
       } else if (stage === OpportunityStage.OUTREACH) {
         await transitionOpportunity({ opportunityId: outbound.opportunityId, to: 'ENGAGED', eventType: 'reply.received', summary: 'The consenting Nordlicht role-player replied.', actor: 'linq', proofRef: event.eventId })
+        stage = OpportunityStage.ENGAGED
+      } else if (stage === OpportunityStage.PAUSED && outbound.opportunity.stageReason === 'BAND_ESCALATE') {
+        await transitionOpportunity({ opportunityId: outbound.opportunityId, to: 'ENGAGED', reason: null, eventType: 'reply.clarified', summary: 'The consenting Nordlicht role-player clarified the paused negotiation.', actor: 'linq', proofRef: event.eventId })
         stage = OpportunityStage.ENGAGED
       } else if (stage === OpportunityStage.NEGOTIATING && isExplicitAcceptance(text)) {
         if (!await negotiationProposalWasDelivered(outbound.demoRunId, outbound.opportunityId)) {
